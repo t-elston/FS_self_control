@@ -26,6 +26,14 @@ def extract_behavior_from_h5(base_folder):
     # get names+paths of .h5 files
     fnames = glob.glob(os.path.join(base_folder, '*.h5'))
 
+    # load the event_codes + event_times for this directory
+    task_events = np.load(base_folder + '/sync_event_codes.npy')
+
+    # find the start and stop of each trial
+    trial_starts = np.argwhere(task_events[:,0] == 9).flatten()
+    trial_ends = np.argwhere(task_events[:,0] == 18).flatten() + 1
+    last_end_time = round(task_events[-1, 1])
+
     for i in range(len(fnames)):
         
         # load the file and get its name       
@@ -36,13 +44,28 @@ def extract_behavior_from_h5(base_folder):
         sessiondf = pd.DataFrame()
 
         # find some characteristics of the eye tracking data
-        #eye_mean, eye_std = get_mean_and_std_eyespeed(f, ftrials)
-        # historical and stable values so everything is always on the same scale
-        eye_mean = .1
-        eye_std = .2
+        eye_mean, eye_std = get_mean_and_std_eyespeed(f, ftrials)
         
+        # loop over each trial
         for t in range(len(ftrials)):
-                    
+
+            # get the times associated with a few task events
+            state_cue_on = 0 # default value; needs to be an integer
+            pics_on_time = 0
+
+            if t < len(trial_starts):
+                # pull the event codes for this trial
+                trial_events = task_events[trial_starts[t] : trial_ends[t], :]
+
+                if np.any(trial_events[:,0] == 3):
+                    state_cue_on_time = int(trial_events[np.argwhere(trial_events[:,0] == 3).flatten(), 1])
+
+                if np.any(trial_events[:,0] == 40):
+                    pics_on_time= int(trial_events[np.argwhere(trial_events[:,0] == 40).flatten(), 1])
+
+
+
+            # extract some features pertaining to this trial        
             sessiondf.at[t,'fname'] = fname
             sessiondf.at[t,'tnum'] = t
             sessiondf.at[t,'use'] = f['ML'][ftrials[t]]['UserVars']['UseTrial'][0]
@@ -68,15 +91,28 @@ def extract_behavior_from_h5(base_folder):
             sessiondf.at[t,'picked_best'] = f['ML'][ftrials[t]]['UserVars']['PickedBestOpt'][0]
             sessiondf.at[t,'rt'] = f['ML'][ftrials[t]]['UserVars']['RT'][0]
             sessiondf.at[t,'side'] = f['ML'][ftrials[t]]['UserVars']['SideChosen'][0]   
+
+            # store the times associated with the onset of the state cue and the choice in the timeline of the neuropixel
+            sessiondf.at[t,'cue_on_t_npx'] = state_cue_on_time 
+            sessiondf.at[t,'pics_on_t_npx'] = pics_on_time 
             
             # get the event code for stim on for saccade detection
-            event_codes = np.array([f['ML'][ftrials[t]]['BehavioralCodes']['CodeNumbers']])
-            event_times = np.array([f['ML'][ftrials[t]]['BehavioralCodes']['CodeTimes']])
-            stim_on_time = np.round(event_times[event_codes==40] / 2).astype(int)
-            stim_off_time = np.round(event_times[event_codes==41] / 2).astype(int)
+            event_codes = np.array([f['ML'][ftrials[t]]['BehavioralCodes']['CodeNumbers']]).squeeze()
+            event_times = np.array([f['ML'][ftrials[t]]['BehavioralCodes']['CodeTimes']]).squeeze()
+
+            # find the times the stimuli turned on/off as well as the time the animal committed to a choice 
+            # - these times are absolute from the onset of the trial
+
+            # check if the stimulus was ever shown
+
+            stim_on_time = np.round(np.mean(event_times[event_codes==40]) / 2).astype(int)
+            stim_off_time = np.round(np.mean(event_times[event_codes==41]) / 2).astype(int)
+
+            # get the time the animal made its choice
+            choice_time = np.round(np.mean(event_times[event_codes==38]) / 2).astype(int)
 
             # get eye data for the trial
-            eye = np.squeeze(np.array([f['ML'][ftrials[t]]['AnalogData']['Eye']]))
+            eye_pos = np.squeeze(np.array([f['ML'][ftrials[t]]['AnalogData']['Eye']]))
             
             # set some dummy vars for the number, time, side, and values of saccades
             sessiondf.at[t, 'n_sacc'] = np.NaN    # nsaccs
@@ -96,36 +132,78 @@ def extract_behavior_from_h5(base_folder):
             sessiondf.at[t, 'sacc5_val'] = np.NaN   # sacc 5
             sessiondf.at[t, 'sacc5_side'] = np.NaN   # sacc 5
 
-            # detect saccades
-            if (stim_on_time.size > 0) & (stim_off_time.size > 0):
             
-                # get speed of eye movements in each direction
-                dx = np.diff(eye[0,:])
-                dy = np.diff(eye[1,:])
+            # check if the stim was ever presented and whether a choice was made
+            if (event_times[event_codes==40].size > 0) & (event_times[event_codes==38].size > 0):
+                
+                # detect saccades
 
-                # get this trial's 2d speed
-                eye_speed = np.hypot(dx,dy)
-                raw_eye_speed = eye_speed
+                # get the x and y coordinates of the eye trace
+                eye_x = eye_pos[0, :]
+                eye_y = eye_pos[1, :]
+
+                # get the speeds of the x and y coordinates
+                eye_dx = np.diff(eye_x)
+                eye_dy = np.diff(eye_y)
+
+                eye_x = eye_x[0:len(eye_dx)]
+                eye_y = eye_y[0:len(eye_dy)]
+
+                # compute the speed of eye movement
+                eye_speed = np.hypot(eye_dx, eye_dy)
 
                 # z score the eye speed
-                eye_speed = (raw_eye_speed - eye_mean) / eye_std
+                z_eye_speed = (eye_speed - eye_mean) / eye_std
 
-                # pull a window of eye_data around when the choice options appear
-                eye = eye[:,stim_on_time[0]:stim_off_time[0]]
-                eye_speed = eye_speed[stim_on_time[0]:stim_off_time[0]]
-
-                # find the saccades
-                sacc_ix = sig.find_peaks(eye_speed, 2, distance = 35)[0]
+                # find the saccades during the choice epoch
+                sacc_ix_choice = sig.find_peaks(z_eye_speed[stim_on_time:choice_time], 7,
+                                          distance = 10)[0]
                 
-                # store some info about the saccades
-                # how many saccades?
+                # get those indices in terms of of the original times
+                sacc_ix = sacc_ix_choice + stim_on_time
+                
+                # how many saccades (allegedly)?
+                valid_sacc = np.zeros((len(sacc_ix), ))
+
+                last_side = 10;
+
+                # now loop over the saccades and validate them:
+                for sacc_num, sacc_sample in enumerate(sacc_ix):
+
+                    # what side of the screen was this?
+                    x_pos = np.mean(eye_x[sacc_sample+1:sacc_sample+10])
+
+                    if x_pos < -5: # saccade was to the left
+                        x_side = -1
+                    elif x_pos > 5: # saccade was to the right
+                        x_side = 1
+                    else: # no saccade was detected
+                        x_side = 10
+
+                    # compare this current saccade with the last one
+                    # - if they were on different sides, then this is a valid saccade
+                    if x_side != last_side:
+                        valid_sacc[sacc_num] = 1
+                        # update the position of the last saccade
+                        last_side = x_side
+
+                # check if the RT on this trial was just crazy, in which case we'll exclude it
+                if f['ML'][ftrials[t]]['UserVars']['RT'][0] > 2000:
+                    valid_sacc = np.zeros((len(sacc_ix), ))
+                
+                # now remove the invalid saccades
+                sacc_ix = sacc_ix[valid_sacc == 1]
+
+                if len(sacc_ix) > 5:
+                    sacc_ix = sacc_ix[0:5]
+
                 sessiondf.at[t, 'n_sacc'] = len(sacc_ix)
-                
+
                 # loop over number of saccades
                 for sacc_num, sacc_sample in enumerate(sacc_ix):
 
                     # what side of the screen was this?
-                    x_pos = np.mean(eye[0,sacc_sample+1:sacc_sample+10])
+                    x_pos = np.mean(eye_x[sacc_sample+1:sacc_sample+10])
                     
                     # was the saccade to the left?
                     if x_pos < -5:
@@ -142,62 +220,71 @@ def extract_behavior_from_h5(base_folder):
                         sacc_side = 0
                         sacc_val = sessiondf.at[t,'ch_val']
 
-                    # get time, relative to onset of pics, the sacc occurred
-                    sacc_time = sacc_sample*2 # data was sampled at 500Hz
+                    # get time, relative to onset of pics, the saccade occurred
+                    sacc_time = (sacc_sample - stim_on_time)*2 # data was sampled at 500Hz
 
                     'sacc' + str(sacc_num+1)+'_t'
                     sessiondf.at[t, 'sacc' + str(sacc_num+1)+'_t'] = sacc_time
                     sessiondf.at[t, 'sacc' + str(sacc_num+1)+'_side'] = sacc_side
                     sessiondf.at[t, 'sacc' + str(sacc_num+1)+'_val'] = sacc_val
 
-                    # #plot eye movement for the trial
-                    # plt.figure()
-                    # colors = cm.magma(np.linspace(0,1,len(eye_speed)))
-                    
-                    # plt.subplot(1,2,1)
-                    # plt.scatter(eye[0,0:len(eye_speed)], eye[1,0:len(eye_speed)], color=colors)
-                    # plt.xlim([-15,15])
-                    # plt.ylim([-15,15])
-                    
-                    # plt.subplot(1,2,2)
-                    # xvals = np.arange(len(eye_speed))*2
-                    # plt.plot(xvals,eye[0,0:len(eye_speed)], label = 'eye x')
-                    # plt.plot(xvals,eye_speed, label = 'speed')
-                    # plt.scatter(xvals, np.ones(len(eye_speed))*-12, color=colors)
+                # # plot eye movement for the trial
+                # plt.figure(figsize=(8,4))
 
-                    # plt.ylim([-15,15])
-                    # plt.plot([sacc_ix*2,sacc_ix*2],plt.ylim(),color='black',linewidth=1)
-                    # plt.legend()
-                    # plt.show()
+                # xvals = (np.arange(len(eye_x)))
+                # colors = cm.magma(np.linspace(0,1,len(xvals)))
+
+                # plt.subplot(1,2,1)
+                # plt.scatter(eye_x[400 : 1400], 
+                #             eye_y[400 : 1400], color=colors[400 : 1400,:])
+                # plt.xlim([-15,15])
+                # plt.ylim([-15,15])
+                
+                # plt.subplot(1,2,2)
+                # plt.plot(xvals, eye_x, label = 'eye x')
+                # plt.plot(xvals, z_eye_speed, label = 'speed (z)', color='tab:gray')
+                # plt.scatter(xvals, np.ones(len(xvals))*-12, color=colors)
+                # plt.title(f'Trial #: {t}')
+
+                # sacc_trace = np.zeros((len(eye_x), ))
+                # choice_trace = np.zeros((len(eye_x), ))
+                # sacc_trace[sacc_ix] = 10
+                # choice_trace[choice_time] = 14
+                # choice_trace[stim_on_time] = 14
+                # plt.ylim([-15,15])
+                # plt.plot(xvals,sacc_trace,color='tab:red',linewidth=1)
+                # plt.plot(xvals,choice_trace,color='black',linewidth=1)
+                # plt.legend(loc='lower left')
+                # plt.show()
 
 
-                    # # check if stimulation was applied and which current
-                    # sessiondf.at[t, 'stim'] = 0
-                    # stim_code = 10
+                # # check if stimulation was applied and which current
+                # sessiondf.at[t, 'stim'] = 0
+                # stim_code = 10
 
-                    # if np.sum(event_codes == 201) > 0:
-                    #     sessiondf.at[t, 'stim'] = 25
-                    #     stim_code = 201
+                # if np.sum(event_codes == 201) > 0:
+                #     sessiondf.at[t, 'stim'] = 25
+                #     stim_code = 201
 
-                    # if np.sum(event_codes == 202) > 0:
-                    #     sessiondf.at[t, 'stim'] = 50
-                    #     stim_code = 202
+                # if np.sum(event_codes == 202) > 0:
+                #     sessiondf.at[t, 'stim'] = 50
+                #     stim_code = 202
 
-                    # if np.sum(event_codes == 203) > 0:
-                    #     sessiondf.at[t, 'stim'] = 75
-                    #     stim_code = 203
+                # if np.sum(event_codes == 203) > 0:
+                #     sessiondf.at[t, 'stim'] = 75
+                #     stim_code = 203
 
-                    # # find when stimulation was applied
-                    # if stim_code != 10:
-                    #     stim_onset_time = np.round(event_times[event_codes==stim_code] / 2).astype(int)[0]
-                    # else:
-                    #     stim_onset_time = np.round(event_times[event_codes==10] / 2).astype(int)[0]
-                    #     stim_onset_time = stim_onset_time - 200
+                # # find when stimulation was applied
+                # if stim_code != 10:
+                #     stim_onset_time = np.round(event_times[event_codes==stim_code] / 2).astype(int)[0]
+                # else:
+                #     stim_onset_time = np.round(event_times[event_codes==10] / 2).astype(int)[0]
+                #     stim_onset_time = stim_onset_time - 200
 
-                    # # calculate mean eye speed during the 200 ms after stim onset (data were sampled at 500 Hz)
-                    # sessiondf.at[t, 'stim_eyespeed'] = np.mean(raw_eye_speed[stim_onset_time: stim_onset_time+100]) 
+                # # calculate mean eye speed during the 200 ms after stim onset (data were sampled at 500 Hz)
+                # sessiondf.at[t, 'stim_eyespeed'] = np.mean(eye_speed[stim_onset_time: stim_onset_time+100]) 
 
-                    xx=[]
+                # xx=[]
 
         # save the data as a .csv in top_parent_dir
         save_name = base_folder + '/' + fname + '_bhv.csv'
@@ -206,29 +293,34 @@ def extract_behavior_from_h5(base_folder):
         print('Saved data as .csv in original directory.')
 
 
-def make_spike_tables_and_combine_data(base_folder, save_dir, spike_params):
+def make_spike_and_LFP_tables_and_combine_data(base_folder, save_dir, chan_map, params, ks_version = 4):
 
     # get the name of this recording
     rec_name = Path(base_folder).stem[0:-3]
 
     # create the file to save into
-    save_name = save_dir + '/' + rec_name + '.h5'
+    save_name = save_dir + '/' + rec_name + '.h5'    
 
     # Create HDF5 file
     with h5py.File(save_name, 'w') as hf:
         pass  # No need to write anything initially, just creating the file
 
+
     # specify the offset and step_size (in milliseconds) for making spike tables
-    t_offset = spike_params['t_offset']
-    step_size = spike_params['step_size']
-    win_size = spike_params['win_size']
-    align_event = spike_params['align_event']
+    t_offset = params['t_offset']
+    step_size = params['step_size']
+    win_size = params['win_size']
+    align_event = params['align_event']
+    lfp_offset = params['lfp_offset']
 
     # load the event_codes + event_times for this directory
     task_events = np.load(base_folder + '/sync_event_codes.npy')
 
     # load the info about which brain area was on which probe
     brain_areas = pd.read_csv(base_folder + '/brain_areas.csv')['brain_area']
+
+    # load the channel map for this probe
+    probe_chan_map = pd.read_csv(chan_map)
 
     # load the behavior
     bhv = pd.read_csv(get_path_from_dir(base_folder, '_bhv'))
@@ -247,18 +339,27 @@ def make_spike_tables_and_combine_data(base_folder, save_dir, spike_params):
         this_brain_area = str(brain_areas[dir_ix])
 
         # load the spike times associated with this directory
-        spike_times = np.load(base_folder + this_dir + '/' + 'ks4_out/sorter_output/sync_spike_times.npy')
-        spike_clusters = np.load(base_folder + this_dir + '/' + 'ks4_out/sorter_output/spike_clusters.npy')
+        if ks_version == 4:
+            spike_times = np.load(base_folder + this_dir + '/' + 'ks4_out/sorter_output/sync_spike_times.npy')
+            spike_clusters = np.load(base_folder + this_dir + '/' + 'ks4_out/sorter_output/spike_clusters.npy')
 
-        # load the cluster metrics
-        cluster_labels=pd.read_csv(base_folder + this_dir + '/' + 'ks4_out/sorter_output/cluster_KSLabel.tsv',sep='\t')
-        quality_metrics = pd.read_csv(base_folder + this_dir + '/' + 'ks4_out/sorter_output/quality_metrics.csv')
+            # load the cluster metrics
+            cluster_labels=pd.read_csv(base_folder + this_dir + '/' + 'ks4_out/sorter_output/cluster_KSLabel.tsv',sep='\t')
+            quality_metrics = pd.read_csv(base_folder + this_dir + '/' + 'ks4_out/sorter_output/quality_metrics.csv')
 
-        templates_average = np.load(base_folder + this_dir + '/' + 'ks4_out/sorter_output/templates.npy')
+            templates_average = np.load(base_folder + this_dir + '/' + 'ks4_out/sorter_output/templates.npy')
+        else: # it's ks3
+            spike_times = np.load(base_folder + this_dir + '/' + 'ks3_out/sorter_output/sync_spike_times.npy')
+            spike_clusters = np.load(base_folder + this_dir + '/' + 'ks3_out/sorter_output/spike_clusters.npy')
+
+            # load the cluster metrics
+            cluster_labels=pd.read_csv(base_folder + this_dir + '/' + 'ks3_out/sorter_output/cluster_KSLabel.tsv',sep='\t')
+            quality_metrics = pd.read_csv(base_folder + this_dir + '/' + 'waveforms_ks3/quality_metrics/metrics.csv')
+            templates_average = np.load(base_folder + this_dir + '/' + 'waveforms_ks3/templates_average.npy')
 
         # find the clusters
         try:
-            cluster_ix = (quality_metrics['presence_ratio'] >= .9) & (quality_metrics['pct_isi_violations'] <= .1)
+            cluster_ix = (quality_metrics['presence_ratio'] > .9) & (quality_metrics['pct_isi_violations'] <= .1)
             good_cluster_nums = quality_metrics['Unnamed: 0'].loc[cluster_ix].values
         except:
             cluster_ix = (cluster_labels['KSLabel'] == 'good') | (cluster_labels['KSLabel'] == 'mua')
@@ -269,7 +370,7 @@ def make_spike_tables_and_combine_data(base_folder, save_dir, spike_params):
         print(str(n_candidate_clusters) + ' putative units found in ' + this_brain_area)
 
         # calculate the spike locations and mean waveforms for the selected units
-        u_mean_waves, u_positions, u_ch = get_unit_waves_and_positions(templates_average[cluster_ix,:,:])
+        u_mean_waves, u_positions, u_ch = get_unit_waves_and_positions(templates_average[cluster_ix,:,:], probe_chan_map)
 
         # now get ready to extract the firing rates
         # specify the bin_centers
@@ -282,6 +383,7 @@ def make_spike_tables_and_combine_data(base_folder, save_dir, spike_params):
 
         dense_FR = np.empty(shape=(len(trial_ends), 2*t_offset, n_candidate_clusters))
         dense_FR[:] = np.nan
+
 
         # now loop over these putatively good units and make spike tables
         unit_names = []
@@ -308,14 +410,9 @@ def make_spike_tables_and_combine_data(base_folder, save_dir, spike_params):
                 # make a spike table if a choice was presented (40 is the event code for pics on)
                 if np.any(trial_events[:,0] == align_event):
 
-                    # pics_on_time = trial_events[np.argwhere(trial_events[:,0] == align_event).flatten(), 1]
-                    # trial_spikes = u_spike_times - pics_on_time
-                    # bins = np.arange(-1*t_offset, t_offset + 2*step_size, step_size)
-                    # firing_rates[t,:, u_ix] = gaussian_filter(np.histogram(trial_spikes, bins)[0]*(1000/step_size), 
-                    #                             sigma=2)
-                    
                     pics_on_time = int(trial_events[np.argwhere(trial_events[:,0] == align_event).flatten(), 1])
                     dense_FR[t,:,u_ix] = u_spike_train[pics_on_time - t_offset : pics_on_time + t_offset]
+
 
         firing_rates, ts = window_smooth(win_size, step_size, dense_FR, np.arange(-1*t_offset, t_offset), 1000)
 
@@ -326,11 +423,13 @@ def make_spike_tables_and_combine_data(base_folder, save_dir, spike_params):
 
         firing_rates = firing_rates[:,start_ix:end_ix+1,:]
         ts = ts[start_ix:end_ix+1]
+        raster_ts = np.arange(-1*t_offset, t_offset, 1, dtype=int)
 
         # find units to reject
         u_mean_FR = np.nanmean(firing_rates, axis=(0, 1))
         units2del = u_mean_FR < 1
         firing_rates2 = np.delete(firing_rates, units2del, axis=2)
+        rasters = np.delete(dense_FR, units2del, axis=2)
         u_mean_FR2 = np.delete(u_mean_FR, units2del, axis=0)
         unit_names2 = [name for name, mask in zip(unit_names, units2del) if not mask]
         z_fr = np.zeros_like(firing_rates2)
@@ -342,16 +441,51 @@ def make_spike_tables_and_combine_data(base_folder, save_dir, spike_params):
             i_u_std = np.nanstd(firing_rates2[:,:, i_u])
             z_fr[:,:,i_u] = (firing_rates2[:,:, i_u] - i_u_mean) / i_u_std
 
+        # update the channel and position information to reflect only kept units
         u_ch2 = np.delete(u_ch, units2del)
         u_positions2 = np.delete(u_positions, units2del, axis=0)
         u_mean_waves2 = np.delete(u_mean_waves, units2del, axis=0)
 
         print('saving ' +str(len(u_mean_FR2)) +' units')
 
-        # now actually save the data
-        # dataframes have their own method
-        bhv.to_hdf(save_name, key='bhv', mode='a')
+        # now load and handle the LFP
+        print('Loading LFP from ' + brain_areas[dir_ix] + '...')
 
+        raw_lfp = np.load(base_folder + this_dir + '/' + 'sync_lfp.npy')
+        lfp_times = np.load(base_folder + this_dir + '/' + 'sync_lfp_ts.npy')
+
+        n_channels = raw_lfp.shape[0]
+        n_trials = len(bhv)
+
+        print('Chopping LFP into trials...')
+
+        # initialize an array to accumulate the data into (n_trials x n_times x n_channels
+        trial_lfp = np.zeros((n_trials, 2*lfp_offset, n_channels), dtype='float16')
+        trial_lfp[:] = np.nan
+
+        for t in range(n_trials):
+
+            # find the align-event for this trial
+            t_align_time = bhv['pics_on_t_npx'].iloc[t]
+
+            # if there was an align-event, then get the LFP
+            if t_align_time > 0:
+
+                t_align_ix = np.argmin(np.abs(lfp_times - t_align_time))
+                start_ix = t_align_ix - lfp_offset
+                end_ix = t_align_ix + lfp_offset
+
+                # was this the last trial and the recording stopped suddenly?
+                if end_ix < raw_lfp.shape[1]:
+
+                    t_lfp = raw_lfp[:, start_ix:end_ix]
+
+                trial_lfp[t, :, :] = t_lfp.T
+
+        # generate a timestamp array for the lfp
+        lfp_ts = np.arange(2*lfp_offset) - lfp_offset
+
+        # now actually save the data
         with h5py.File(save_name, 'a') as hf:
             # Write data into the file with the specified variable name
             hf.create_dataset(this_brain_area + '_FR', data=firing_rates2)
@@ -360,15 +494,22 @@ def make_spike_tables_and_combine_data(base_folder, save_dir, spike_params):
             hf.create_dataset(this_brain_area + '_channels', data=u_ch2)
             hf.create_dataset(this_brain_area + '_locations', data=u_positions2)
             hf.create_dataset(this_brain_area + '_mean_wf', data=u_mean_waves2)
+            hf.create_dataset(this_brain_area + '_lfp', data=trial_lfp)
 
             if dir_ix == 0:
                 hf.create_dataset('ts', data=ts)
+                hf.create_dataset('lfp_ts', data = lfp_ts)
+
+                # save the behavior and channel map dataframes
+                bhv.to_hdf(save_name, key='bhv', mode='a')
+                probe_chan_map.to_hdf(save_name, key='chan_map', mode='a')
 
             # Get the keys (dataset names) present in the HDF5 file
             keys = list(hf.keys())  # List of keys in the HDF5 file
-
-            # Store the keys as an attribute named 'dataset_names'
             hf.attrs['dataset_names'] = keys
+
+        print('Data saved for this file. \n')
+
 
 
 def window_smooth(win_size, step_size, indata, in_times, fs):
@@ -446,7 +587,8 @@ def get_mean_and_std_eyespeed(f, ftrials):
     - ftrials (list): List of indices or identifiers for specific trials.
 
     Returns:
-    - tuple: A tuple containing the mean and standard deviation of eye movement speed.
+    - tuple: A tuple containing the mean and standard deviation of eye movement speed
+             during the rule-cue epoch
     """
     all_eye_speed = np.array([])
 
@@ -454,17 +596,17 @@ def get_mean_and_std_eyespeed(f, ftrials):
         # get the event code for stim on for saccade detection
         event_codes = np.array([f['ML'][ftrials[t]]['BehavioralCodes']['CodeNumbers']])
         event_times = np.array([f['ML'][ftrials[t]]['BehavioralCodes']['CodeTimes']])
-        stim_on_time = np.round(event_times[event_codes==40] / 2).astype(int)
-        stim_off_time = np.round(event_times[event_codes==41] / 2).astype(int)
+        rule_on_time = np.round(event_times[event_codes==3] / 2).astype(int)
+        rule_off_time = np.round(event_times[event_codes==50] / 2).astype(int)
 
         # get eye data for the trial
         eye = np.squeeze(np.array([f['ML'][ftrials[t]]['AnalogData']['Eye']]))
 
         # detect saccades
-        if (stim_on_time.size > 0) & (stim_off_time.size > 0):
+        if (rule_on_time.size > 0) & (rule_off_time.size > 0):
             # get speed of eye movements in each direction
-            dx = np.diff(eye[0, :])
-            dy = np.diff(eye[1, :])
+            dx = np.diff(eye[0, rule_on_time[0]:rule_off_time[0]])
+            dy = np.diff(eye[1, rule_on_time[0]:rule_off_time[0]])
 
             # get 2d speed
             eye_speed = np.hypot(dx, dy)
@@ -516,13 +658,14 @@ def generate_channel_map(y_pitch, total_channels, x_pitch):
     return vertical_position, horizontal_position
 
 
-def get_unit_waves_and_positions(templates_average):
+def get_unit_waves_and_positions(templates_average, probe_chan_map):
     """
     Obtain unit wave characteristics and positions based on input templates_average.
 
     Args:
     - templates_average (numpy.ndarray): A 3D array containing mean waveform templates for units.
       The dimensions are: (n_units, n_samples, n_channels).
+    - probe_chan_map (pandas.dataframe): a dataframe containing the x and y coordinates of each channel
 
     Returns:
     - u_wave_means (numpy.ndarray): A 2D array representing mean waveforms for each unit.
@@ -544,8 +687,8 @@ def get_unit_waves_and_positions(templates_average):
     u_wave_means = np.zeros(shape=(n_units, n_samples))
     u_max_ch = np.zeros(shape=(n_units, )).astype(int)
 
-    # create a local channel map
-    vertical_position, horizontal_position = generate_channel_map(15, 384, 40)
+    vertical_position = probe_chan_map['y_coords'].values
+    horizontal_position = probe_chan_map['x_coords'].values
 
     for u in range(n_units):
         u_waves = templates_average[u, :, :]
