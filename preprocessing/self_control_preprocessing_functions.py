@@ -423,13 +423,13 @@ def make_spike_and_LFP_tables_and_combine_data(base_folder, save_dir, chan_map, 
 
         firing_rates = firing_rates[:,start_ix:end_ix+1,:]
         ts = ts[start_ix:end_ix+1]
-        raster_ts = np.arange(-1*t_offset, t_offset, 1, dtype=int)
+        #raster_ts = np.arange(-1*t_offset, t_offset, 1, dtype=int)
 
         # find units to reject
         u_mean_FR = np.nanmean(firing_rates, axis=(0, 1))
         units2del = u_mean_FR < 1
         firing_rates2 = np.delete(firing_rates, units2del, axis=2)
-        rasters = np.delete(dense_FR, units2del, axis=2)
+        #rasters = np.delete(dense_FR, units2del, axis=2)
         u_mean_FR2 = np.delete(u_mean_FR, units2del, axis=0)
         unit_names2 = [name for name, mask in zip(unit_names, units2del) if not mask]
         z_fr = np.zeros_like(firing_rates2)
@@ -508,7 +508,7 @@ def make_spike_and_LFP_tables_and_combine_data(base_folder, save_dir, chan_map, 
             keys = list(hf.keys())  # List of keys in the HDF5 file
             hf.attrs['dataset_names'] = keys
 
-        print('Data saved for this file. \n')
+        print('Data saved for this probe. \n')
 
 
 
